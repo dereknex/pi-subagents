@@ -10,6 +10,7 @@
  *   /agents                 — Interactive agent management menu
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -55,6 +56,35 @@ import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+
+export const DIRECT_TERMINAL_PROTOCOL = "pi-subagents/direct-terminal/v3" as const;
+export const DIRECT_TERMINAL_PROVIDER = "@tintinweb/pi-subagents" as const;
+
+export interface DirectTerminalSnapshot {
+  readonly protocol: typeof DIRECT_TERMINAL_PROTOCOL;
+  readonly provider: typeof DIRECT_TERMINAL_PROVIDER;
+  readonly managerInstanceId: string;
+  readonly spawnNonce: string;
+  readonly agentId: string;
+  readonly terminalSequence: 1;
+  readonly status: AgentRecord["status"];
+  readonly resultText: string;
+  readonly resultDigestInput: string;
+  readonly error?: string;
+  readonly model?: string;
+  readonly durationMs?: number;
+  readonly usage: Readonly<LifetimeUsage>;
+}
+
+export interface DirectTerminalHandle {
+  readonly protocol: typeof DIRECT_TERMINAL_PROTOCOL;
+  readonly provider: typeof DIRECT_TERMINAL_PROVIDER;
+  readonly managerInstanceId: string;
+  readonly spawnNonce: string;
+  readonly agentId: string;
+  readonly terminal: Promise<DirectTerminalSnapshot>;
+  readonly stop: () => boolean;
+}
 
 // ---- Shared helpers ----
 
@@ -441,8 +471,39 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  const managerInstanceId = randomUUID();
+  type DirectTerminalWaiter = {
+    spawnNonce: string;
+    model?: string;
+    resolve: (snapshot: DirectTerminalSnapshot) => void;
+  };
+  const directTerminalWaiters = new Map<string, DirectTerminalWaiter>();
+
+  function settleDirectTerminal(record: AgentRecord, resultText: string): void {
+    const waiter = directTerminalWaiters.get(record.id);
+    if (!waiter) return;
+    directTerminalWaiters.delete(record.id);
+    const usage = Object.freeze({ ...record.lifetimeUsage });
+    waiter.resolve(Object.freeze({
+      protocol: DIRECT_TERMINAL_PROTOCOL,
+      provider: DIRECT_TERMINAL_PROVIDER,
+      managerInstanceId,
+      spawnNonce: waiter.spawnNonce,
+      agentId: record.id,
+      terminalSequence: 1 as const,
+      status: record.status,
+      resultText,
+      resultDigestInput: resultText,
+      error: record.error,
+      model: waiter.model,
+      durationMs: record.completedAt === undefined ? undefined : record.completedAt - record.startedAt,
+      usage,
+    }));
+  }
+
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    settleDirectTerminal(record, record.result ?? "");
     // Nested children report only through their owning parent's scoped tools.
     // Keep them out of top-level lifecycle, transcript, notification, and UI channels.
     if (record.parentAgentId) return;
@@ -546,15 +607,62 @@ export default function (pi: ExtensionAPI) {
     if (!dispatch.ok) throw new Error(dispatch.message);
     return manager.spawn(piRef, ctxRef, dispatch.type, prompt, safeOptions);
   };
-  const registryEntry = {
+  const spawnAttested = (piRef: any, ctxRef: any, type: string, prompt: string, options: any): DirectTerminalHandle => {
+    const spawnNonce = randomUUID();
+    let resolveTerminal!: (snapshot: DirectTerminalSnapshot) => void;
+    const terminal = new Promise<DirectTerminalSnapshot>((resolve) => {
+      resolveTerminal = resolve;
+    });
+    const agentId = spawnTopLevel(piRef, ctxRef, type, prompt, {
+      ...(options ?? {}),
+      isBackground: true,
+      bypassQueue: false,
+    });
+    const record = manager.getRecord(agentId);
+    if (!record || record.parentAgentId) {
+      if (record && !record.parentAgentId) manager.abort(agentId);
+      throw new Error("direct terminal spawn did not produce a top-level manager record");
+    }
+    const model = options?.model
+      ? `${options.model.provider ?? "unknown"}/${options.model.id ?? "unknown"}`
+      : undefined;
+    directTerminalWaiters.set(agentId, {
+      spawnNonce,
+      model,
+      resolve: resolveTerminal,
+    });
+    if (record.status !== "queued" && record.status !== "running") {
+      settleDirectTerminal(record, record.result ?? "");
+    }
+    return Object.freeze({
+      protocol: DIRECT_TERMINAL_PROTOCOL,
+      provider: DIRECT_TERMINAL_PROVIDER,
+      managerInstanceId,
+      spawnNonce,
+      agentId,
+      terminal,
+      stop: () => {
+        const wasQueued = manager.getRecord(agentId)?.status === "queued";
+        const stopped = manager.abort(agentId);
+        const stoppedRecord = manager.getRecord(agentId);
+        if (stopped && wasQueued && stoppedRecord) settleDirectTerminal(stoppedRecord, "");
+        return stopped;
+      },
+    });
+  };
+  const registryEntry = Object.freeze({
+    protocol: DIRECT_TERMINAL_PROTOCOL,
+    provider: DIRECT_TERMINAL_PROVIDER,
+    managerInstanceId,
     waitForAll: () => manager.waitForAll(),
     hasRunning: () => manager.hasRunning(),
     spawn: spawnTopLevel,
+    spawnAttested,
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
       return record?.parentAgentId ? undefined : record;
     },
-  };
+  });
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
   if (ownsManagerRegistry) {
     (globalThis as any)[MANAGER_KEY] = registryEntry;
@@ -645,6 +753,10 @@ export default function (pi: ExtensionAPI) {
     }
     scheduler.stop();
     manager.abortAll();
+    for (const agentId of [...directTerminalWaiters.keys()]) {
+      const record = manager.getRecord(agentId);
+      if (record) settleDirectTerminal(record, record.result ?? "");
+    }
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
