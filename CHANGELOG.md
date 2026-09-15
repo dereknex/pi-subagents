@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **An idle session no longer keeps rendering a static agent widget.** The above-editor widget ticked every 80ms and only stopped when it had nothing left to show at all, but a finished agent lingers by *turns* rather than by time — so once a run settled and no further turn arrived, the tick survived for the rest of the process, re-diffing the terminal 12.5 times a second for one unchanging `✓` line. A finished line has no spinner and no clock, so the timer now stops as soon as nothing is running and the event-driven updates (`markFinished`, `onTurnStart`, a new spawn) restart it, and while something *is* running the cadence is 250ms rather than 80ms — a braille spinner needs a few frames a second, not a dozen full diffs.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
 ## [0.19.0] - 2026-08-25
